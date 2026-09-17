@@ -35,6 +35,28 @@ def _profile_user_agent() -> str:
         return "hermes-cli"
 
 
+def merge_extra_body(base: dict[str, Any], additions: dict[str, Any]) -> dict[str, Any]:
+    """Merge ``additions`` into ``base`` and return the result (inputs untouched).
+
+    Ordinary keys keep the usual last-writer-wins semantics.
+    ``chat_template_kwargs`` is the one exception and is deep-merged: a
+    caller may hold template flags (e.g. ``enable_thinking: False`` for a
+    cheap aux call) while a provider profile mirrors ``reasoning_effort``
+    into the same object, and wholesale replacement would drop whichever
+    side merged first. On key conflicts, ``additions`` wins.
+    """
+    merged = dict(base)
+    if not additions:
+        return merged
+    base_ctk = merged.get("chat_template_kwargs")
+    new_ctk = additions.get("chat_template_kwargs")
+    if isinstance(base_ctk, dict) and isinstance(new_ctk, dict):
+        additions = dict(additions)
+        additions["chat_template_kwargs"] = {**base_ctk, **new_ctk}
+    merged.update(additions)
+    return merged
+
+
 @dataclass
 class ProviderProfile:
     """Base provider profile — subclass or instantiate with overrides."""

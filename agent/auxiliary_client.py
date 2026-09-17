@@ -6406,9 +6406,13 @@ def _merge_aux_extra_body(
     extra_body: Optional[dict], projection: _ProfileProjection, reasoning_config: Optional[dict], provider_norm: str,
 ) -> Dict[str, Any]:
     """Caller extra_body + profile body/reasoning + generic reasoning fallback + Nous tags."""
-    merged_extra = dict(extra_body or {})
-    merged_extra.update(projection.body)
-    merged_extra.update(projection.reasoning_extra)
+    # merge_extra_body deep-merges chat_template_kwargs: callers may pin
+    # template flags (e.g. enable_thinking: False for cheap title calls)
+    # while the profile mirrors reasoning_effort into the same object.
+    from providers.base import merge_extra_body
+
+    merged_extra = merge_extra_body(extra_body or {}, projection.body)
+    merged_extra = merge_extra_body(merged_extra, projection.reasoning_extra)
     if reasoning_config and isinstance(reasoning_config, dict) and not projection.handles_reasoning:
         if reasoning_config.get("enabled") is False:
             merged_extra["reasoning"] = {"enabled": False}

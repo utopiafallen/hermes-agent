@@ -2156,6 +2156,13 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         """Defer retries after a structural no-op WITHOUT striking the anti-thrash breaker.
         Nothing eligible existed, so nothing was "ineffective"; striking would permanently disarm
         auto-compaction on short sessions. The backoff still stops per-turn re-scans."""
+        # [LOCAL PATCH 2026-09-01] Never arm the structural no-op backoff —
+        # _record_structural_no_op is the sole site that sets
+        # _structural_no_op_backoff_until non-zero, so returning here
+        # fully disables the "structural_backoff:<n>" block end-to-end
+        # (block-reason + auto-compact gate both read that timestamp).
+        if self._DISABLE_STRUCTURAL_NO_OP_BACKOFF:
+            return
         self._structural_no_op_backoff_until = time.monotonic() + self._STRUCTURAL_NO_OP_BACKOFF_SECONDS
         if not self.quiet_mode:
             logger.warning(
@@ -2357,6 +2364,36 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
 
     # Structural no-op (nothing eligible) is not an ineffective attempt: defer retries instead of striking.
     _STRUCTURAL_NO_OP_BACKOFF_SECONDS = 300.0
+
+    # [LOCAL PATCH 2026-08-25] User-requested: disable the anti-thrash
+    # "ineffective" latch entirely. Over-threshold sessions keep attempting
+    # automatic compaction on every turn instead of backing off after two
+    # <10%-savings passes (or two fallback-marker streaks). Re-enable the
+    # guard by flipping this to False. The summary-LLM 429 cooldown gate is
+    # deliberately NOT affected.
+    _DISABLE_ANTI_THRASH_BLOCK = True
+
+    # [LOCAL PATCH 2026-09-01] User-requested: disable the structural no-op
+    # backoff (#93022) entirely. An over-threshold session that keeps hitting
+    # a "nothing eligible in the protection window" no-op was being deferred
+    # for 300s on every attempt (surfaced as "compression is currently
+    # blocked (structural_backoff:<n>)"), so the context just kept growing.
+    # With the flag set, _record_structural_no_op() becomes a no-op and the
+    # gate never defers on it — the scan retries on the next turn. Re-enable
+    # the 300s transient defer by flipping this to False. The summary-LLM
+    # 429 cooldown gate is deliberately NOT affected.
+    _DISABLE_STRUCTURAL_NO_OP_BACKOFF = True
+
+    # [LOCAL PATCH 2026-09-02] User-requested: never skip the summary LLM
+    # call based on the "middle window too small to be worth it" feasibility
+    # check. When automatic compression kicks in, the summary LLM must always
+    # run (the user wants the LLM exercised every time, not deferred to the
+    # deterministic message-dropping fallback when the compressible window
+    # looks cheap). Gating on this makes the feasibility block in compress()
+    # inert for the automatic path. Re-enable the cheap-window skip by
+    # flipping this to False. The summary-LLM 429 cooldown gate is
+    # deliberately NOT affected.
+    _DISABLE_FEASIBILITY_SKIP = True
 
     @staticmethod
     def _coerce_max_tokens(value: Any) -> int | None:
@@ -2631,6 +2668,9 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         for label, until in (
             ("cooldown", self._summary_failure_cooldown_until), ("structural_backoff", self._structural_no_op_backoff_until),
         ):
+            # [LOCAL PATCH] structural no-op backoff disabled (see _DISABLE_STRUCTURAL_NO_OP_BACKOFF).
+            if label == "structural_backoff" and self._DISABLE_STRUCTURAL_NO_OP_BACKOFF:
+                continue
             remaining = until - time.monotonic()
             if remaining > 0:
                 return f"{label}:{remaining:.0f}"
@@ -2638,6 +2678,12 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
 
     def _tripped(self) -> bool:
         """Anti-thrash breaker state: two ineffective compactions or two fallback summaries in a row."""
+        # [LOCAL PATCH 2026-08-25] anti-thrash latch disabled via
+        # _DISABLE_ANTI_THRASH_BLOCK — see the flag's comment. Returns False so
+        # both consumption sites (block-reason "ineffective" + auto-compact gate)
+        # never trip while the flag is set.
+        if self._DISABLE_ANTI_THRASH_BLOCK:
+            return False
         return self._ineffective_compression_count >= 2 or self._fallback_compression_streak >= 2
 
     def _refresh_durable_guards(self) -> None:
@@ -2669,6 +2715,9 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
             (self._summary_failure_cooldown_until, ignore_cooldown, "summary LLM in cooldown"),
             (self._structural_no_op_backoff_until, False, "structural no-op backoff"),
         ):
+            # [LOCAL PATCH] structural no-op backoff disabled (see _DISABLE_STRUCTURAL_NO_OP_BACKOFF).
+            if what == "structural no-op backoff" and self._DISABLE_STRUCTURAL_NO_OP_BACKOFF:
+                continue
             remaining = until - time.monotonic()
             if remaining > 0 and not skip:
                 if not self.quiet_mode:
@@ -4104,6 +4153,44 @@ Write only the summary body. Do not include any preamble or prefix."""
                 return i
         return last_any
 
+    def _forced_compress_bounds(self, messages: List[Dict[str, Any]]) -> tuple[int, int]:
+        """Forced ``/compress`` boundary (local patch).
+
+        Used when the normal token-budget window is empty so an explicit
+        ``/compress`` still exercises the summary LLM.  Returns a maximal
+        middle that honours the hard invariants:
+
+        * head  = the leading system prompt(s) only (never summarised);
+        * tail  = the most recent actionable user turn, kept verbatim and
+                  pulled backward across any trailing tool-result group so no
+                  tool_call/result pair is split.
+
+        Returns ``(start, end)`` with ``end > start`` whenever at least one
+        summarisable message sits between the system prompt and the mandatory
+        tail; otherwise ``start == end`` (genuinely nothing to summarise).
+        """
+        n = len(messages)
+        # Minimal protected head: the leading system prompt(s) only.
+        start = 0
+        while start < n and (messages[start].get("role") or "") == "system":
+            start += 1
+        start = self._align_boundary_forward(messages, start)
+        if start >= n:
+            return start, start
+        # Mandatory verbatim tail anchored on the last actionable user turn.
+        last_user = self._find_last_user_message_idx(messages, 0)
+        if last_user <= start:
+            # No user turn beyond the head: keep a small trailing floor.
+            end = max(start + 1, min(n, n - 3))
+        else:
+            end = last_user
+        end = min(end, n - 1) if n - 1 > start else start
+        # Never split a tool group: pull the boundary back to its parent.
+        end = self._align_boundary_backward(messages, end)
+        if end <= start:
+            return start, start
+        return start, end
+
     def _ensure_last_assistant_message_in_tail(
         self, messages: List[Dict[str, Any]], cut_idx: int, head_end: int,
     ) -> int:
@@ -4774,7 +4861,11 @@ Write only the summary body. Do not include any preamble or prefix."""
         n_messages = len(messages)
         # Only need head + 3 tail messages minimum (token budget decides the real tail size)
         _min_for_compress = self._protect_head_size(messages) + 3 + 1
-        if n_messages <= _min_for_compress:
+        # [LOCAL PATCH] Manual /compress (force=True) skips this "too few
+        # messages" no-op so an explicit request always gets a real try; a
+        # genuinely empty window is still caught by the force-boundary
+        # fallback and the empty-window guard below.
+        if not force and n_messages <= _min_for_compress:
             self._structural_no_op_result(
                 telemetry, "insufficient_messages", f"only {n_messages} messages (need > {_min_for_compress})",
             )
@@ -4791,20 +4882,33 @@ Write only the summary body. Do not include any preamble or prefix."""
         # Phase 2: Determine boundaries
         compress_start, compress_end = self._compress_window(messages)
         if compress_start >= compress_end:
-            self._record_compression_regions(
-                head_messages=messages[:compress_start], middle_messages=[], tail_messages=messages[compress_end:],
-            )
-            self._structural_no_op_result(
-                telemetry, "no_compressible_window",
-                f"compress_start ({compress_start}) >= compress_end ({compress_end}) - transcript fits within tail budget",
-            )
-            return messages
+            # [LOCAL PATCH] Manual /compress (force=True) must still exercise
+            # the summary LLM: fall back to a forced maximal window (system-
+            # only head + last actionable user turn verbatim) instead of
+            # no-op'ing. Only a genuinely empty forced window returns.
+            if force:
+                compress_start, compress_end = self._forced_compress_bounds(messages)
+            if compress_start >= compress_end:
+                self._record_compression_regions(
+                    head_messages=messages[:compress_start], middle_messages=[], tail_messages=messages[compress_end:],
+                )
+                self._structural_no_op_result(
+                    telemetry, "no_compressible_window",
+                    f"compress_start ({compress_start}) >= compress_end ({compress_end}) - transcript fits within tail budget",
+                )
+                return messages
         turns_to_summarize = messages[compress_start:compress_end]
         # Lean mode demotes stale tail tool results before summary generation so stubs exist even if it aborts.
         if getattr(self, "tail_mode", "lean") == "lean":
             messages = self._demote_stale_tail_tools(messages, compress_end)
         scan = self._scan_window_handoffs(messages, compress_start, compress_end, turns_to_summarize)
         turns_to_summarize = scan.turns_to_summarize
+        # [LOCAL PATCH] Manual /compress (force=True): a handoff-only window
+        # must not become a no-op. If the handoff strip emptied the window,
+        # summarise the raw (unstripped) window so the summary LLM is always
+        # exercised — handoff summaries are legitimate compressible content.
+        if force and not turns_to_summarize:
+            turns_to_summarize = list(messages[compress_start:compress_end])
         self._record_compression_regions(
             head_messages=messages[:compress_start], middle_messages=turns_to_summarize, tail_messages=messages[compress_end:],
         )
@@ -4823,7 +4927,11 @@ Write only the summary body. Do not include any preamble or prefix."""
             )
 
         # Phase 3: Generate structured summary (or skip the LLM when the middle is too small to matter)
-        feasibility_skip = not force and self._feasibility_skip(telemetry, turns_to_summarize, compress_start, compress_end)
+        # [LOCAL PATCH 2026-09-02] Never take the feasibility skip — always run
+        # the summary LLM once compression reaches Phase 3 (see
+        # _DISABLE_FEASIBILITY_SKIP). The gate is left intact so flipping the
+        # flag back to False restores the cheap-window skip verbatim.
+        feasibility_skip = not force and not self._DISABLE_FEASIBILITY_SKIP and self._feasibility_skip(telemetry, turns_to_summarize, compress_start, compress_end)
         summary = None  # feasibility skip: no LLM call; Phase 4 inserts the deterministic fallback
         if not feasibility_skip:
             summary = self._summarize_window(

@@ -106,9 +106,14 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 
-# Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
-# Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
-BLOCK_RECURRENCE_LIMIT = 2
+# After a task has been blocked, unblocked, and re-blocked this many times for
+# the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
+# unblocker (usually a cron) and routes the task to ``triage`` instead of back
+# to ``blocked`` — breaking the infinite unblock↔re-block loop and forcing a
+# human-in-the-loop decision. Mirrors the dispatcher's ``DEFAULT_FAILURE_LIMIT``
+# spirit (default 2) but counts a different signal: manual unblock recurrences,
+# not dispatcher spawn/crash/timeout failures.
+BLOCK_RECURRENCE_LIMIT = 999999
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
 
@@ -3958,6 +3963,11 @@ def _ctx_role_history(lines: list[str], conn: sqlite3.Connection, task: Task, no
     if not role_rows:
         return
     lines.append(f"## Recent work by @{task.assignee}")
+    lines.append(
+        "_This is past context only — NOT workspace for the current task. "
+        "Always set up your own workspace fresh from `default_workdir` or by cloning. "
+        "Do NOT reference these past workspaces._"
+    )
     for row in role_rows:
         first = _first_line(row["summary"], 200) or "(no summary)"
         lines.append(

@@ -3172,7 +3172,7 @@ def _finish_compaction_boundary(
     agent: Any, compressed: list, *, new_system_prompt: str, old_session_id: Optional[str], in_place: bool,
     compacted_in_place: bool, session_commit_succeeded: bool, defer_context_engine_notification: bool,
     compression_made_progress: bool, compression_used_fallback: bool, compression_feasibility_skip: bool,
-    task_id: str,
+    task_id: str, messages_before_compression: Optional[list] = None,
 ) -> int:
     """Post-commit bookkeeping: notify engines/providers/hooks, re-arm usage tracking.
     Returns the rough post-compression token estimate (diagnostics only)."""
@@ -3258,6 +3258,14 @@ def _finish_compaction_boundary(
             )
         else:
             compressor._verify_compaction_cleared_threshold = True
+    elif compressed != messages_before_compression:
+        # A pruning-only / no-window commit still rewrote the transcript, so the
+        # real-usage verdict must adjudicate it. Without this, no-window passes are
+        # invisible to the anti-thrash strike loop: no strike accrues, should_compress()
+        # never backs off, and the session re-fires a no-op commit every turn, forever.
+        # Arm ONLY the verdict — not record_completed_compaction: no summary ran, so
+        # fallback-streak / summary-quality semantics stay untouched.
+        compressor._verify_compaction_cleared_threshold = True
     _reset_read_dedup_caches(task_id, session_id=agent.session_id or "")
     return _compressed_est
 
@@ -3847,6 +3855,7 @@ def compress_context(
             defer_context_engine_notification=defer_context_engine_notification,
             compression_made_progress=commit.made_progress, compression_used_fallback=_compression_used_fallback,
             compression_feasibility_skip=_compression_feasibility_skip, task_id=task_id,
+            messages_before_compression=messages_before_compression,
         )
         logger.info(
             "context compression done: session=%s messages=%d->%d rough_tokens=~%s awaiting_real_usage=true",

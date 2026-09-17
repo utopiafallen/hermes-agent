@@ -296,6 +296,71 @@ class TestDelegateTask(unittest.TestCase):
             self.assertEqual(kwargs["provider"], parent.provider)
             self.assertEqual(kwargs["api_mode"], parent.api_mode)
 
+    def test_per_call_model_overrides_delegation_pin(self):
+        """A per-call model/provider must override the delegation.* config pin
+        for this call only, routing the child onto the requested model without
+        touching config.yaml. A named per-call provider also wins over a base_url
+        pin in the delegation config."""
+        parent = _make_mock_parent(depth=0)
+        with patch("hermes_cli.config.load_config_readonly", return_value={
+            "delegation": {"base_url": "https://pinned.example/v1",
+                           "model": "pinned-model", "api_key": "pinned-key"},
+        }), patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                  return_value={"provider": "nous", "base_url": None,
+                                "api_key": "nous-key", "api_mode": "chat_completions"}):
+            with patch("run_agent.AIAgent") as MockAgent:
+                mock_child = MagicMock()
+                mock_child.run_conversation.return_value = {
+                    "final_response": "ok",
+                    "completed": True,
+                    "api_calls": 1,
+                }
+                MockAgent.return_value = mock_child
+
+                delegate_task(
+                    goal="route to a cheaper model",
+                    tasks=[{"goal": "summarize"}],
+                    model="qwen3.6",
+                    provider="nous",
+                    parent_agent=parent,
+                )
+
+                _, kwargs = MockAgent.call_args
+                self.assertEqual(kwargs["model"], "qwen3.6")
+                self.assertEqual(kwargs["provider"], "nous")
+                self.assertEqual(kwargs["api_key"], "nous-key")
+
+    def test_per_call_model_only_leaves_provider_inherited(self):
+        """Supplying only `model` must not clear the delegation provider — the
+        child keeps the pinned provider but rides the requested model."""
+        parent = _make_mock_parent(depth=0)
+        with patch("hermes_cli.config.load_config_readonly", return_value={
+            "delegation": {"base_url": "https://pinned.example/v1",
+                           "model": "pinned-model", "api_key": "pinned-key"},
+        }):
+            with patch("run_agent.AIAgent") as MockAgent:
+                mock_child = MagicMock()
+                mock_child.run_conversation.return_value = {
+                    "final_response": "ok",
+                    "completed": True,
+                    "api_calls": 1,
+                }
+                MockAgent.return_value = mock_child
+
+                delegate_task(
+                    goal="model-only override",
+                    tasks=[{"goal": "summarize"}],
+                    model="qwen3.6",
+                    parent_agent=parent,
+                )
+
+                _, kwargs = MockAgent.call_args
+                self.assertEqual(kwargs["model"], "qwen3.6")
+                self.assertEqual(kwargs["provider"], "custom")
+                self.assertEqual(kwargs["base_url"], "https://pinned.example/v1")
+                self.assertEqual(kwargs["api_key"], "pinned-key")
+
+
     def test_child_gets_dedicated_session_db_not_parents_handle(self):
         """#81267: children must not share the parent's SessionDB object.
 
@@ -1618,6 +1683,112 @@ class TestDelegationReasoningEffort(unittest.TestCase):
         )
         call_kwargs = MockAgent.call_args[1]
         self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "low"})
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("run_agent.AIAgent")
+    def test_per_call_overrides_config(self, MockAgent, mock_cfg):
+        """A per-call reasoning_effort beats delegation.reasoning_effort."""
+        mock_cfg.return_value = {"max_iterations": 50, "reasoning_effort": "xhigh"}
+        MockAgent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        parent.reasoning_config = {"enabled": True, "effort": "low"}
+
+        _build_child_agent(
+            task_index=0, goal="test", context=None, toolsets=None,
+            model=None, max_iterations=50, parent_agent=parent,
+            task_count=1, override_reasoning_effort="high",
+        )
+        call_kwargs = MockAgent.call_args[1]
+        self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "high"})
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("run_agent.AIAgent")
+    def test_per_call_none_disables_thinking(self, MockAgent, mock_cfg):
+        """Per-call 'none' disables thinking even when config sets a level."""
+        mock_cfg.return_value = {"max_iterations": 50, "reasoning_effort": "xhigh"}
+        MockAgent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        parent.reasoning_config = {"enabled": True, "effort": "xhigh"}
+
+        _build_child_agent(
+            task_index=0, goal="test", context=None, toolsets=None,
+            model=None, max_iterations=50, parent_agent=parent,
+            task_count=1, override_reasoning_effort="none",
+        )
+        call_kwargs = MockAgent.call_args[1]
+        self.assertEqual(call_kwargs["reasoning_config"], {"enabled": False})
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("run_agent.AIAgent")
+    def test_per_call_unknown_falls_back_to_config(self, MockAgent, mock_cfg):
+        """An unrecognized per-call value warns and falls back to config."""
+        mock_cfg.return_value = {"max_iterations": 50, "reasoning_effort": "low"}
+        MockAgent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        parent.reasoning_config = {"enabled": True, "effort": "xhigh"}
+
+        _build_child_agent(
+            task_index=0, goal="test", context=None, toolsets=None,
+            model=None, max_iterations=50, parent_agent=parent,
+            task_count=1, override_reasoning_effort="bogus",
+        )
+        call_kwargs = MockAgent.call_args[1]
+        self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "low"})
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("run_agent.AIAgent")
+    def test_delegate_task_forwards_top_level_effort(self, MockAgent, mock_cfg):
+        """delegate_task(reasoning_effort=...) reaches the child constructor."""
+        mock_cfg.return_value = {"max_iterations": 50, "reasoning_effort": "xhigh"}
+        mock_child = MagicMock()
+        mock_child.run_conversation.return_value = {
+            "final_response": "ok",
+            "completed": True,
+            "api_calls": 1,
+        }
+        MockAgent.return_value = mock_child
+        parent = _make_mock_parent()
+        parent.reasoning_config = {"enabled": True, "effort": "xhigh"}
+
+        delegate_task(
+            goal="Test per-call effort",
+            reasoning_effort="low",
+            parent_agent=parent,
+        )
+
+        call_kwargs = MockAgent.call_args[1]
+        self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "low"})
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("run_agent.AIAgent")
+    def test_per_task_effort_beats_top_level(self, MockAgent, mock_cfg):
+        """In a batch, a task's own reasoning_effort wins over the top-level one."""
+        mock_cfg.return_value = {"max_iterations": 50}
+        mock_child = MagicMock()
+        mock_child.run_conversation.return_value = {
+            "final_response": "ok",
+            "completed": True,
+            "api_calls": 1,
+        }
+        MockAgent.return_value = mock_child
+        parent = _make_mock_parent()
+        parent.reasoning_config = {"enabled": True, "effort": "xhigh"}
+
+        delegate_task(
+            tasks=[
+                {"goal": "Deep analysis of module A", "reasoning_effort": "xhigh"},
+                {"goal": "Mechanical rename sweep of module B"},
+            ],
+            reasoning_effort="low",
+            parent_agent=parent,
+        )
+
+        # Two children constructed — check each call's reasoning_config.
+        calls = [c[1] for c in MockAgent.call_args_list]
+        self.assertEqual(
+            calls[0]["reasoning_config"], {"enabled": True, "effort": "xhigh"}
+        )
+        self.assertEqual(calls[1]["reasoning_config"], {"enabled": True, "effort": "low"})
 
 # =========================================================================
 # Dispatch helper, progress events, concurrency

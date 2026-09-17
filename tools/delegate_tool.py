@@ -20,6 +20,7 @@ from tools.terminal_tool import set_approval_callback as _set_subagent_approval_
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
+from hermes_constants import VALID_REASONING_EFFORTS
 
 # The delegate_tool_* siblings hold the pieces split out of this module; every name callers or patching tests reach as
 # ``tools.delegate_tool.<name>`` is re-imported here. Mutable flag globals live only in their owning module.
@@ -168,7 +169,9 @@ def _build_child_agent(
     override_api_key: Optional[str] = None,
     override_api_mode: Optional[str] = None,
     override_request_overrides: Optional[Dict[str, Any]] = None,
-
+    # Per-call reasoning effort (raw value; applied below). Takes precedence over
+    # delegation.reasoning_effort config and parent inheritance.
+    override_reasoning_effort: Optional[str] = None,
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
@@ -223,6 +226,21 @@ def _build_child_agent(
         override_acp_args=override_acp_args,
         routing_cfg=routing_cfg,
     )
+    # Per-call reasoning effort override: re-apply on top of the resolution done in
+    # _resolve_child_runtime (delegation.reasoning_effort > parent inherit). A per-call
+    # value beats the delegation pin and parent inheritance; an unparseable/unknown
+    # level warns and falls back to that resolved value.
+    if override_reasoning_effort is not None:
+        from hermes_constants import parse_reasoning_effort
+
+        _parsed_effort = parse_reasoning_effort(override_reasoning_effort)
+        if _parsed_effort is not None:
+            rt["reasoning_config"] = _parsed_effort
+        else:
+            logger.warning(
+                "Unknown per-call reasoning_effort '%s', falling back to delegation config / parent level",
+                override_reasoning_effort,
+            )
     if override_request_overrides is not None:
         # honored whenever set, incl. the inherit branch where
         # _resolve_delegation_credentials already merged OVER the parent's
@@ -363,6 +381,7 @@ def _build_children(
     task_list: List[Dict[str, Any]], task_schemas: List[Optional[Dict[str, Any]]], creds: Dict[str, Any], *,
     top_role: str, max_iterations: int, parent_agent, routing_cfg: Dict[str, Any],
     live_deleg_id: Optional[str], live_writers: list, task_images: Optional[List[Optional[List[str]]]] = None,
+    top_effort: Optional[str] = None,
 ) -> tuple[List[tuple], Optional[str]]:
     """Build every child on the main thread (construction is not thread-safe);
     ``(children, None)`` or ``([], error)`` on an explicit-pin preflight failure."""
@@ -378,6 +397,9 @@ def _build_children(
     }
     children = []
     for i, t in enumerate(task_list):
+        # Per-task reasoning_effort beats the top-level one; both are raw values —
+        # _build_child_agent parses and warns on unknown levels.
+        effective_effort = t.get("reasoning_effort") or top_effort
         _task_schema = task_schemas[i] if i < len(task_schemas) else None
         _child_context = t.get("context")
         if _task_schema is not None:
@@ -387,6 +409,7 @@ def _build_children(
                 task_index=i, goal=t["goal"], context=_child_context,
                 toolsets=None,  # always inherit the parent's toolsets
                 model=creds["model"], max_iterations=max_iterations, task_count=len(task_list),
+                override_reasoning_effort=effective_effort,
                 parent_agent=parent_agent, role=_normalize_role(t.get("role") or top_role), **overrides,
             )
         except ValueError as exc:
@@ -417,13 +440,19 @@ def _build_children(
 def delegate_task(
     goal: Optional[str] = None, context: Optional[str] = None, tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None, role: Optional[str] = None, background: Optional[bool] = None,
-    output_schema: Optional[Dict[str, Any]] = None, images: Optional[List[str]] = None, action: Optional[str] = None,
-    subagent_id: Optional[str] = None, message: Optional[str] = None, parent_agent=None,
+    output_schema: Optional[Dict[str, Any]] = None, reasoning_effort: Optional[str] = None,
+    images: Optional[List[str]] = None, action: Optional[str] = None,
+    subagent_id: Optional[str] = None, message: Optional[str] = None,
+    model: Optional[str] = None, provider: Optional[str] = None, parent_agent=None,
     credentials_cfg: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Spawn child agents (single ``goal`` or ``tasks=[...]`` batch) or control running ones. ``action``
     list/steer/stop run synchronously and bypass the pause gate, depth limit and async dispatch. ``role`` is legacy
-    (per-task beats top-level; capability is depth-derived). Returns JSON with one results entry per task, or a
+    (per-task beats top-level; capability is depth-derived). ``reasoning_effort`` sets each child's
+    reasoning effort for this call (e.g. 'low' for cheap mechanical work, 'xhigh' for deep reviews);
+    per-task reasoning_effort beats the top-level one; omit to fall back to config, then parent.
+    ``model``/``provider`` override delegation.model / delegation.provider for THIS call only. Returns JSON with
+    one results entry per task, or a
     dispatch handle when running in the background."""
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
@@ -442,6 +471,10 @@ def delegate_task(
         )
 
     top_role = _normalize_role(role)
+    # Top-level reasoning effort applies to every child of this call unless a
+    # task carries its own reasoning_effort.
+    top_effort = (reasoning_effort or "").strip() or None
+
     # background applies to single tasks AND batches: a batch is ONE async unit
     # that joins on every child and re-enters as a single consolidated message.
     background = is_truthy_value(background, default=False) if background is not None else False
@@ -464,10 +497,21 @@ def delegate_task(
             "delegate_task: ignoring caller-supplied max_iterations=%s; using delegation.max_iterations=%s from config",
             max_iterations, default_max_iter,
         )
-    # credentials_cfg (internal callers only, e.g. /review → auxiliary.review) is
-    # a per-call routing owner shaped like the delegation config section. Keep
-    # the route and its fallback policy together through child construction.
-    routing_cfg = credentials_cfg if credentials_cfg is not None else cfg
+    # credentials_cfg (internal callers only, e.g. /review) is a per-call routing owner shaped like the
+    # delegation config section. Per-call model/provider overrides (the model-facing `model`/`provider` params of
+    # delegate_task) take precedence over the delegation.* config pin for THIS call: a caller routing one
+    # delegation to a cheaper/different model should not have to rewrite config.yaml.
+    per_call_cfg = None
+    if model is not None or provider is not None:
+        # Copy the config and override model/provider; when a named provider is given we also drop any base_url
+        # pin so the named-provider branch resolves it (a base_url short-circuit otherwise collapses the provider
+        # to 'custom' and ignores it).
+        per_call_cfg = dict(cfg)
+        per_call_cfg["model"] = model or per_call_cfg.get("model")
+        per_call_cfg["provider"] = provider or per_call_cfg.get("provider")
+        if provider is not None:
+            per_call_cfg.pop("base_url", None)
+    routing_cfg = per_call_cfg if per_call_cfg is not None else (credentials_cfg if credentials_cfg is not None else cfg)
     try:
         creds = _resolve_delegation_credentials(routing_cfg, parent_agent)
     except ValueError as exc:
@@ -496,6 +540,7 @@ def delegate_task(
     children, err = _build_children(
         task_list, task_schemas, creds, top_role=top_role, max_iterations=default_max_iter, parent_agent=parent_agent,
         routing_cfg=routing_cfg, live_deleg_id=live_deleg_id, live_writers=live_writers, task_images=task_images,
+        top_effort=top_effort,
     )
     if err:
         return tool_error(err)
@@ -637,6 +682,12 @@ DELEGATE_TASK_SCHEMA = {
                             "Background THIS child needs: file paths, error messages, constraints. Each child "
                             "sees only its own context — repeat shared background in every task that needs it.",
                         ),
+                        "reasoning_effort": _p(
+                            "string",
+                            "Per-task reasoning effort override. Beats the top-level 'reasoning_effort'. 'none'"
+                            "disables thinking for this child.",
+                            enum=["none", *VALID_REASONING_EFFORTS],
+                        ),
                         "output_schema": _p(
                             "object",
                             "Optional JSON Schema this child's final answer must validate against (told to the "
@@ -682,6 +733,26 @@ DELEGATE_TASK_SCHEMA = {
                 "For action='steer': the course correction, appended to "
                 "the child's next tool result mid-run. Be directive and specific.",
             ),
+              "reasoning_effort": _p(
+                  "string",
+                  "Reasoning effort for the child agent(s) of this call (e.g. 'low' for cheap mechanical work, "
+                  "'xhigh' for deep reviews). 'none' disables thinking. Overrides delegation.reasoning_effort"
+                  "from config.yaml for these children; a per-task reasoning_effort beats this value. Omit to fall"
+                  "back to config, then the parent's own effort.",
+                  enum=["none", *VALID_REASONING_EFFORTS],
+              ),
+              "model": _p(
+                  "string",
+                  "Run this delegation's children on a specific model. Overrides delegation.model from config.yaml"
+                  "for this call only. Omit to inherit the parent model (or the delegation.* pin).",
+              ),
+              "provider": _p(
+                  "string",
+                  "Run this delegation's children on a specific provider. Overrides delegation.provider from"
+                  "config.yaml for this call only. Native providers (openrouter, nous, minimax-cn, ...) resolve their"
+                  "own credentials; a custom endpoint is reached via base_url. Supply alongside `model`. Omit to"
+                  "inherit the parent provider (or the delegation.* pin).",
+              ),
         },
         "required": [],
     },
@@ -716,7 +787,9 @@ registry.register(
         goal=args.get("goal"), context=args.get("context"), tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"), role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")), output_schema=args.get("output_schema"),
-        images=args.get("images"), action=args.get("action"), subagent_id=args.get("subagent_id"), message=args.get("message"),
+        reasoning_effort=args.get("reasoning_effort"), images=args.get("images"), action=args.get("action"),
+        subagent_id=args.get("subagent_id"), message=args.get("message"),
+        model=args.get("model"), provider=args.get("provider"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

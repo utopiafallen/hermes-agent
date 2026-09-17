@@ -18,6 +18,8 @@ from typing import Any, Dict, List, Optional
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.fast_mode import begin_turn as begin_fast_mode_turn
 from agent.message_metadata import append_message
+import os
+from agent.loop_detection import detect_semantic_loop
 from agent.message_sanitization import _repair_tool_call_arguments, _sanitize_surrogates
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, _estimate_tools_tokens_rough
 from agent.process_bootstrap import _install_safe_stdio
@@ -1522,7 +1524,28 @@ def _run_conversation_turn(
             break
         _run_phase(prepare_iteration, agent, s)
         _run_phase(assemble_api_request, agent, s)
+        _compression_attempts_before = s.compression_attempts
         _pg = _run_phase(run_preflight_gate, agent, s)
+        # Compression refund (local): a preflight pass that ran but made NO progress
+        # (no compressible window / pruning-only / aborted) must not consume the shared
+        # overflow-recovery / anti-thrash budget. A completed compaction is the unit the
+        # budget prices and its only provider-confirmed recovery path; a pass that never
+        # made progress can never be confirmed, so counting it starves the 413/400
+        # handlers of the same counter. Guarded on a real attempt (the counter increased)
+        # so a stale flag from a prior turn never refunds an iteration where no
+        # compression ran; the lock-skip path self-refunds, netting to zero and staying
+        # below this guard. getattr guard for test doubles built via object.__new__.
+        if s.compression_attempts > _compression_attempts_before and not bool(
+            getattr(agent.context_compressor, "_last_compression_made_progress", False)
+        ):
+            s.compression_attempts -= 1
+            logger.info(
+                "Pre-API compression committed without a completed compaction "
+                "(no compressible window / pruning only); refunded the attempt to "
+                "preserve the overflow-recovery budget (%d of %d)",
+                s.compression_attempts,
+                s.max_compression_attempts,
+            )
         if _pg.action == "return":
             return _pg.result
         if _pg.action == "break":
@@ -1554,6 +1577,22 @@ def _run_conversation_turn(
             _v = _run_phase(
                 run_tool_round if s.assistant_message.tool_calls else finish_text_response, agent, s
             )
+            # ── Loop detection (local) ───────────────────────────────────
+            # Check if the agent is stuck in a repetition pattern (re-reading the
+            # same file 3+ times, cycling "going in circles" phrasing). Only applies
+            # to kanban worker profiles (gated by the HERMES_KANBAN_TASK env var), not
+            # the main profile. Runs on the tool-call path, once the assistant turn +
+            # tool results are appended to `messages`; it injects a checkpoint user
+            # message forcing summarize-or-stop.
+            if s.assistant_message.tool_calls and os.environ.get("HERMES_KANBAN_TASK"):
+                _loop_msg = detect_semantic_loop(
+                    s.messages,
+                    agent.max_iterations,
+                    s.api_call_count,
+                )
+                if _loop_msg:
+                    logger.info("Loop detection checkpoint: %s", _loop_msg[:80])
+                    append_message(s.messages, {"role": "user", "content": _loop_msg})
             if _v.action == "return":
                 return _v.result
             if _v.action == "break":

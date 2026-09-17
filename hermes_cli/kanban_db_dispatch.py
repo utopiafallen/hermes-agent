@@ -2442,9 +2442,32 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
         # configured hooks still register.
         "--accept-hooks",
     ]
+    # Per-task force-loaded skills (merged with config default skills).
     # One `--skills X` pair per name: easier to read in `ps` and avoids quoting
     # ambiguity if a skill name contains unusual chars.
+    #
+    # `skills.default` from config.yaml is loaded for every worker so
+    # board-context, forgejo, etc. are always available without requiring
+    # per-task skill pins.  Task-level `task.skills` (set via
+    # kanban_create) is merged on top so callers can add role-specific
+    # skills without losing the defaults.
+    _default_skills: list[str] = []
+    try:
+        from hermes_cli.config import load_config
+        _cfg = load_config()
+        _cfg_skills = _cfg.get("skills") or {}
+        if isinstance(_cfg_skills, dict):
+            _raw = _cfg_skills.get("default")
+            if isinstance(_raw, list):
+                _default_skills = [str(s) for s in _raw if s]
+    except Exception:
+        _kb._log.debug("kanban worker: could not read skills.default from config", exc_info=True)
+    # Merge: defaults first, then task-level overrides (deduped).
+    _all_skills: list[str] = list(_default_skills)
     for sk in task.skills or ():
+        if sk and sk not in _all_skills:
+            _all_skills.append(sk)
+    for sk in _all_skills:
         if sk:
             cmd.extend(["--skills", sk])
     if task.model_override:

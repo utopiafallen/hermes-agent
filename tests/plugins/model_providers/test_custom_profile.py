@@ -12,6 +12,10 @@ These tests pin the wire-shape contract:
     - enabled + effort    → top-level reasoning_effort (native OpenAI-compat
                           format GLM/ARK expect), passed through verbatim
                           including ``max``/``xhigh``
+    - both cases above    → ALSO chat_template_kwargs.reasoning_effort, because
+                          vLLM/SGLang serving Qwen3-style templates read the
+                          effort from chat_template_kwargs, not the
+                          top-level field
     - enabled + no effort → nothing emitted (endpoint's server default applies)
     - ollama_num_ctx      → extra_body.options.num_ctx, orthogonal to reasoning
 """
@@ -50,29 +54,38 @@ class TestCustomReasoningWireShape:
         assert tl == {}
 
     def test_disabled_sends_think_false(self, custom_profile):
-        """enabled=False on an Ollama URL → reasoning_effort='none' + think=False.
+        """enabled=False on an Ollama URL → reasoning_effort='none' + think=False
+        + chat_template_kwargs.reasoning_effort='none'.
 
-        Both fields are required on Ollama: /v1/chat/completions silently
-        ignores extra_body.think (only /api/chat honours it — ollama#14820)
-        but respects top-level reasoning_effort (#25758). think=False stays
-        for proxies and the native /api/chat path.
+        All three fields are required on Ollama: /v1/chat/completions
+        silently ignores extra_body.think (only /api/chat honours it —
+        ollama#14820) but respects top-level reasoning_effort (#25758);
+        vLLM/SGLang serving Qwen3-style templates read the effort from
+        chat_template_kwargs. think=False stays for proxies and the
+        native /api/chat path.
         """
         eb, tl = custom_profile.build_api_kwargs_extras(
             reasoning_config={"enabled": False},
             model="qwen3",
             base_url="http://127.0.0.1:11434/v1",
         )
-        assert eb == {"think": False}
+        assert eb == {
+            "think": False,
+            "chat_template_kwargs": {"reasoning_effort": "none"},
+        }
         assert tl == {"reasoning_effort": "none"}
 
     def test_effort_none_sends_think_false(self, custom_profile):
-        """effort='none' is the disable alias → same dual emission on Ollama."""
+        """effort='none' is the disable alias → same triple emission."""
         eb, tl = custom_profile.build_api_kwargs_extras(
             reasoning_config={"enabled": True, "effort": "none"},
             model="qwen3",
             base_url="http://localhost:11434/v1",
         )
-        assert eb == {"think": False}
+        assert eb == {
+            "think": False,
+            "chat_template_kwargs": {"reasoning_effort": "none"},
+        }
         assert tl == {"reasoning_effort": "none"}
 
     def test_disabled_omits_think_on_mistral(self, custom_profile):
@@ -116,7 +129,10 @@ class TestCustomReasoningWireShape:
             model="qwen3",
             base_url="https://ollama.com/v1",
         )
-        assert eb == {"think": False}
+        assert eb == {
+            "think": False,
+            "chat_template_kwargs": {"reasoning_effort": "none"},
+        }
         assert tl == {"reasoning_effort": "none"}
 
     @pytest.mark.parametrize(
@@ -147,18 +163,30 @@ class TestCustomReasoningWireShape:
         "effort", ["minimal", "low", "medium", "high", "xhigh", "max"]
     )
     def test_enabled_effort_goes_top_level(self, custom_profile, effort):
-        """enabled + effort → TOP-LEVEL reasoning_effort, passed through verbatim.
+        """enabled + effort → TOP-LEVEL reasoning_effort, passed through
+        verbatim, mirrored into chat_template_kwargs.
 
         GLM-5.2/ARK and OpenAI-compatible reasoning APIs read reasoning_effort
         as a top-level string, not nested in extra_body. ``max`` is GLM's
-        native deep-reasoning level and must survive.
+        native deep-reasoning level and must survive. The mirror covers
+        vLLM/SGLang Qwen3-style templates, which only read it from
+        chat_template_kwargs.
         """
         eb, tl = custom_profile.build_api_kwargs_extras(
             reasoning_config={"enabled": True, "effort": effort}, model="glm-5.2"
         )
         assert tl == {"reasoning_effort": effort}
-        assert "reasoning_effort" not in eb
+        assert eb == {"chat_template_kwargs": {"reasoning_effort": effort}}
         assert "think" not in eb
+
+    def test_enabled_without_effort_emits_nothing(self, custom_profile):
+        """enabled + no effort → nothing emitted: the endpoint's server-side
+        default applies (we must not force a level the user didn't pick)."""
+        eb, tl = custom_profile.build_api_kwargs_extras(
+            reasoning_config={"enabled": True, "effort": ""}, model="glm-5.2"
+        )
+        assert eb == {}
+        assert tl == {}
 
 
     def test_does_not_force_think_true_on_enable(self, custom_profile):

@@ -493,16 +493,8 @@ def _dedup_stub_or_block(task_data: dict, dedup_key: tuple, path: str) -> str:
         _cap_read_tracker_data(task_data)
 
     if hits >= 2:
-        return tool_error(
-            f"BLOCKED: You have called read_file on this "
-            f"exact region {hits + 1} times and the file "
-            "has NOT changed. STOP calling read_file for "
-            "this path — the content from your earlier "
-            "read_file result in this conversation is "
-            "still current. Proceed with your task using "
-            "the information you already have.",
-            path=path,
-            already_read=hits + 1)
+        # Disabled: repeated read_file blocking was too aggressive.
+        pass
 
     return json.dumps({
         "status": "unchanged",

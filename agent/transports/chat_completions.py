@@ -459,8 +459,14 @@ class ChatCompletionsTransport(ProviderTransport):
             elif raw_thinking_config:
                 extra_body["thinking_config"] = raw_thinking_config
 
-        if params.get("extra_body_additions"):
-            extra_body.update(params["extra_body_additions"])
+        # Merge any pre-built extra_body additions (deep-merges
+        # chat_template_kwargs — see merge_extra_body)
+        additions = params.get("extra_body_additions")
+        if additions:
+            from providers.base import merge_extra_body
+
+            extra_body = merge_extra_body(extra_body, additions)
+
         if extra_body:
             api_kwargs["extra_body"] = extra_body
         if params.get("request_overrides"):
@@ -493,14 +499,28 @@ class ChatCompletionsTransport(ProviderTransport):
             base_url=params.get("base_url"), reasoning_config=reasoning_config,
             openrouter_min_coding_score=params.get("openrouter_min_coding_score"),
         )
-        for part in (profile_body, extra_body_from_profile, params.get("extra_body_additions")):
-            if part:
-                extra_body.update(part)
-        for k, v in (params.get("request_overrides") or {}).items():
-            if k == "extra_body" and isinstance(v, dict):
-                extra_body.update(v)
-            else:
-                api_kwargs[k] = v
+        # Merge pre-built profile / caller extra_body additions via merge_extra_body
+        # (deep-merges chat_template_kwargs so caller-side template flags survive —
+        # e.g. the custom profile mirrors reasoning_effort into it).
+        from providers.base import merge_extra_body
+
+        if profile_body:
+            extra_body = merge_extra_body(extra_body, profile_body)
+
+        if extra_body_from_profile:
+            extra_body = merge_extra_body(extra_body, extra_body_from_profile)
+
+        additions = params.get("extra_body_additions")
+        if additions:
+            extra_body = merge_extra_body(extra_body, additions)
+
+        overrides = params.get("request_overrides")
+        if overrides:
+            for k, v in overrides.items():
+                if k == "extra_body" and isinstance(v, dict):
+                    extra_body = merge_extra_body(extra_body, v)
+                else:
+                    api_kwargs[k] = v
 
         if extra_body:
             # Native Gemini speaks Google's REST schema: OpenAI-style extra_body

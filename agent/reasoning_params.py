@@ -135,7 +135,8 @@ class ReasoningParamsMixin:
         if cached is not None and cached[0] == key:
             return cached[1]
         result = (self._needs_deepseek_tool_reasoning() or self._needs_kimi_tool_reasoning()
-                  or self._needs_mimo_tool_reasoning() or self._reasoning_echo_opt_in())
+                  or self._needs_mimo_tool_reasoning() or self._reasoning_echo_opt_in()
+                  or self._needs_qwen_thinking_pad())
         self._thinking_pad_cache = (key, result)
         return result
 
@@ -171,6 +172,24 @@ class ReasoningParamsMixin:
     def _needs_mimo_tool_reasoning(self) -> bool:
         """True when the current provider is Xiaomi MiMo thinking mode."""
         return matches_reasoning_echo_family("mimo", (self.provider or "").lower(), self.model, self.base_url)
+
+    def _needs_qwen_thinking_pad(self) -> bool:
+        """Return True when the current model is Qwen3.6/Qwen3.8/Ornith and
+        needs reasoning_content echo-back for preserve_thinking support.
+
+        Qwen3.6's, Qwen3.8's, and Ornith's preserve_thinking feature requires
+        reasoning_content from prior turns to be included in the prompt so
+        the chat template can render the thinking tags. We promote the 'reasoning' field to
+        'reasoning_content' at replay time.
+
+        Detection is model-name-based: Qwen3.6 and Qwen3.8 models contain
+        "qwen3.6" / "qwen3.8" in their name (e.g. "qwen3.6-plus",
+        "qwen3.6-27b", "qwen3.6-35b-a3b", "qwen3.8-max"); Ornith models
+        contain "ornith" (e.g. "Ornith-1.5-35B-A3B",
+        "unsloth/Ornith-1.5-35B-A3B:Q6_K").
+        """
+        model = (getattr(self, "model", "") or "").lower()
+        return "qwen3.6" in model or "qwen3.8" in model or "ornith" in model
 
     _copy_reasoning_content_for_api = _forward("agent.agent_runtime_helpers", "copy_reasoning_content_for_api")
 

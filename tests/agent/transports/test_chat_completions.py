@@ -372,6 +372,43 @@ class TestChatCompletionsBuildKwargs:
         assert kw.get("extra_body", {}).get("think") is None
         assert kw.get("reasoning_effort") == "none"
 
+    def test_custom_effort_mirrored_into_chat_template_kwargs(self, transport):
+        """vLLM/SGLang serving Qwen3-style templates read reasoning_effort
+        from chat_template_kwargs, not the top-level field — the custom
+        profile must emit both, end-to-end through the transport."""
+        from providers import get_provider_profile
+        profile = get_provider_profile("custom")
+        msgs = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="qwen3", messages=msgs,
+            provider_profile=profile,
+            reasoning_config={"enabled": True, "effort": "medium"},
+        )
+        assert kw["reasoning_effort"] == "medium"
+        assert kw["extra_body"]["chat_template_kwargs"] == {
+            "reasoning_effort": "medium",
+        }
+
+    def test_custom_caller_template_kwargs_survive_profile_mirror(self, transport):
+        """A caller's chat_template_kwargs (e.g. enable_thinking=False for
+        cheap title calls) must deep-merge with the profile's
+        reasoning_effort mirror — wholesale replacement would drop one side."""
+        from providers import get_provider_profile
+        profile = get_provider_profile("custom")
+        msgs = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="qwen3", messages=msgs,
+            provider_profile=profile,
+            reasoning_config={"enabled": True, "effort": "high"},
+            extra_body_additions={
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+        )
+        assert kw["extra_body"]["chat_template_kwargs"] == {
+            "reasoning_effort": "high",
+            "enable_thinking": False,
+        }
+
 
 
     def test_gemini_openai_compat_flash_reasoning_maps_to_nested_google_thinking_config(self, transport):

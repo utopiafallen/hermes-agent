@@ -288,6 +288,59 @@ class TestQwenProfile:
         assert "metadata" not in eb
 
 
+class TestMergeExtraBody:
+    """providers.base.merge_extra_body — last-writer-wins, with one exception:
+    chat_template_kwargs is deep-merged so caller template flags (e.g.
+    enable_thinking: False for cheap aux calls) survive a profile's
+    reasoning_effort mirror."""
+
+    def test_plain_merge_last_writer_wins(self):
+        from providers.base import merge_extra_body
+
+        out = merge_extra_body({"a": 1, "keep": "x"}, {"b": 2, "keep": "y"})
+        assert out == {"a": 1, "b": 2, "keep": "y"}
+
+    def test_chat_template_kwargs_deep_merged(self):
+        from providers.base import merge_extra_body
+
+        out = merge_extra_body(
+            {"chat_template_kwargs": {"reasoning_effort": "high"}},
+            {"chat_template_kwargs": {"enable_thinking": False}},
+        )
+        assert out["chat_template_kwargs"] == {
+            "reasoning_effort": "high",
+            "enable_thinking": False,
+        }
+
+    def test_chat_template_kwargs_conflict_additions_win(self):
+        from providers.base import merge_extra_body
+
+        out = merge_extra_body(
+            {"chat_template_kwargs": {"reasoning_effort": "medium"}},
+            {"chat_template_kwargs": {"reasoning_effort": "low"}},
+        )
+        assert out["chat_template_kwargs"] == {"reasoning_effort": "low"}
+
+    def test_non_dict_chat_template_kwargs_replaced_wholesale(self):
+        from providers.base import merge_extra_body
+
+        out = merge_extra_body(
+            {"chat_template_kwargs": "bogus"},
+            {"chat_template_kwargs": {"enable_thinking": False}},
+        )
+        assert out["chat_template_kwargs"] == {"enable_thinking": False}
+
+    def test_inputs_not_mutated(self):
+        from providers.base import merge_extra_body
+
+        base = {"chat_template_kwargs": {"a": 1}}
+        adds = {"chat_template_kwargs": {"b": 2}}
+        out = merge_extra_body(base, adds)
+        assert base == {"chat_template_kwargs": {"a": 1}}
+        assert adds == {"chat_template_kwargs": {"b": 2}}
+        assert out["chat_template_kwargs"] == {"a": 1, "b": 2}
+
+
 class TestAlibabaRegionalAndTokenPlanProfiles:
     """#73265: the models.dev catalog advertises alibaba-cn /
     alibaba-token-plan(-cn) / alibaba-coding-plan-cn, but none were registered
