@@ -37,7 +37,7 @@ Use any model you want — [Nous Portal](https://portal.nousresearch.com), OpenR
 ### Linux, macOS, WSL2, Termux
 
 ```bash
-curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/utopiafallen/hermes-agent/custom/scripts/install.sh | bash
 ```
 
 ### Windows (native, PowerShell)
@@ -224,7 +224,7 @@ full git checkout it creates at `$HERMES_HOME/hermes-agent` (usually
 managed venv, lazy dependencies, gateway, and docs tooling.
 
 ```bash
-curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/utopiafallen/hermes-agent/custom/scripts/install.sh | bash
 cd "${HERMES_HOME:-$HOME/.hermes}/hermes-agent"
 uv pip install -e ".[all,dev]"
 scripts/run_tests.sh
