@@ -45,10 +45,11 @@ def build_update_parser(subparsers, *, cmd_update: Callable) -> None:
             "never silently ride along across updates.")
     update_parser.add_argument(
         "--branch", default=None, metavar="NAME",
-        help="Update against this branch instead of the default (main). "
-            "If the local checkout is on a different branch, hermes will "
-            "switch to the requested branch first (auto-stashing any "
-            "uncommitted changes).")
+        help="Update against this branch. Defaults to the branch the checkout is "
+            "currently on (so a fork's custom branch updates itself, not main); pass "
+            "main to follow the upstream default. If the local checkout is on a "
+            "different branch than requested, hermes will switch to the requested "
+            "branch first (auto-stashing any uncommitted changes).")
     update_parser.add_argument(
         "--switch-branch", action="store_true", default=False,
         help="With updates.parked_branch_strategy: update_in_place configured, "

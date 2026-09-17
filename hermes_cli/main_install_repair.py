@@ -1246,5 +1246,38 @@ def _resolve_node_runtime_npm() -> str | None:
 
 
 def _resolve_update_branch(args) -> str:
-    """Normalize ``args.branch`` to a non-empty name (default ``main``; blank/whitespace = default)."""
-    return (getattr(args, "branch", None) or "main").strip() or "main"
+    """Resolve the branch ``hermes update`` targets.
+
+    An explicit ``--branch NAME`` wins. Otherwise the managed checkout's current branch is
+    used, so an install living on a non-default branch (e.g. a fork's ``custom``) updates
+    itself instead of silently flipping to ``main`` — and because the fork/upstream sync is
+    scoped to ``branch == "main"``, a custom-branch install never pulls from upstream. When
+    there is no usable current branch (not a git repo, detached HEAD, or git unreadable) fall
+    back to ``main`` to preserve the historical default."""
+    explicit = (getattr(args, "branch", None) or "").strip()
+    if explicit:
+        return explicit
+    return _checkout_current_branch() or "main"
+
+
+def _checkout_current_branch() -> str | None:
+    """The branch the managed checkout is currently on.
+
+    ``None`` when there is no resolvable current branch — not a git repo, HEAD detached (git
+    reports ``HEAD``), or git itself can't be read. Callers fall back to a default then.
+    Best-effort: a local ``rev-parse`` (no network), never raises.
+    """
+    from hermes_cli.main import PROJECT_ROOT
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(PROJECT_ROOT), "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    branch = result.stdout.strip()
+    if not branch or branch == "HEAD":
+        return None
+    return branch
