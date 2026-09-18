@@ -500,8 +500,7 @@ class ChatCompletionsTransport(ProviderTransport):
             openrouter_min_coding_score=params.get("openrouter_min_coding_score"),
         )
         # Merge pre-built profile / caller extra_body additions via merge_extra_body
-        # (deep-merges chat_template_kwargs so caller-side template flags survive —
-        # e.g. the custom profile mirrors reasoning_effort into it).
+        # (deep-merges chat_template_kwargs so caller-side template flags survive).
         from providers.base import merge_extra_body
 
         if profile_body:

@@ -6406,9 +6406,9 @@ def _merge_aux_extra_body(
     extra_body: Optional[dict], projection: _ProfileProjection, reasoning_config: Optional[dict], provider_norm: str,
 ) -> Dict[str, Any]:
     """Caller extra_body + profile body/reasoning + generic reasoning fallback + Nous tags."""
-    # merge_extra_body deep-merges chat_template_kwargs: callers may pin
+    # merge_extra_body deep-merges chat_template_kwargs so caller-pinned
     # template flags (e.g. enable_thinking: False for cheap title calls)
-    # while the profile mirrors reasoning_effort into the same object.
+    # survive the profile's extra_body additions.
     from providers.base import merge_extra_body
 
     merged_extra = merge_extra_body(extra_body or {}, projection.body)

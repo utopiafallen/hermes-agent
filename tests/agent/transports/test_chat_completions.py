@@ -372,10 +372,10 @@ class TestChatCompletionsBuildKwargs:
         assert kw.get("extra_body", {}).get("think") is None
         assert kw.get("reasoning_effort") == "none"
 
-    def test_custom_effort_mirrored_into_chat_template_kwargs(self, transport):
-        """vLLM/SGLang serving Qwen3-style templates read reasoning_effort
-        from chat_template_kwargs, not the top-level field — the custom
-        profile must emit both, end-to-end through the transport."""
+    def test_custom_effort_top_level_only(self, transport):
+        """Reasoning effort rides top-level — the custom profile does not
+        inject chat_template_kwargs (llama.cpp, vLLM and SGLang all accept
+        the top-level field; template flags belong to config extra_body)."""
         from providers import get_provider_profile
         profile = get_provider_profile("custom")
         msgs = [{"role": "user", "content": "Hi"}]
@@ -385,14 +385,12 @@ class TestChatCompletionsBuildKwargs:
             reasoning_config={"enabled": True, "effort": "medium"},
         )
         assert kw["reasoning_effort"] == "medium"
-        assert kw["extra_body"]["chat_template_kwargs"] == {
-            "reasoning_effort": "medium",
-        }
+        assert "chat_template_kwargs" not in kw.get("extra_body", {})
 
-    def test_custom_caller_template_kwargs_survive_profile_mirror(self, transport):
+    def test_custom_caller_template_kwargs_pass_through(self, transport):
         """A caller's chat_template_kwargs (e.g. enable_thinking=False for
-        cheap title calls) must deep-merge with the profile's
-        reasoning_effort mirror — wholesale replacement would drop one side."""
+        cheap title calls) must survive the profile's extras merge —
+        wholesale replacement would drop it."""
         from providers import get_provider_profile
         profile = get_provider_profile("custom")
         msgs = [{"role": "user", "content": "Hi"}]
@@ -405,7 +403,6 @@ class TestChatCompletionsBuildKwargs:
             },
         )
         assert kw["extra_body"]["chat_template_kwargs"] == {
-            "reasoning_effort": "high",
             "enable_thinking": False,
         }
 

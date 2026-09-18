@@ -10,12 +10,10 @@ These tests pin the wire-shape contract:
     - disabled on Ollama  → extra_body.think = False + reasoning_effort=none
     - disabled elsewhere  → reasoning_effort=none, no think (strict APIs 422)
     - enabled + effort    → top-level reasoning_effort (native OpenAI-compat
-                          format GLM/ARK expect), passed through verbatim
-                          including ``max``/``xhigh``
-    - both cases above    → ALSO chat_template_kwargs.reasoning_effort, because
-                          vLLM/SGLang serving Qwen3-style templates read the
-                          effort from chat_template_kwargs, not the
-                          top-level field
+                          format GLM/ARK, vLLM, SGLang and llama.cpp expect),
+                          passed through verbatim including ``max``/``xhigh``;
+                          no chat_template_kwargs injection (endpoints that
+                          need template flags set them via config extra_body)
     - enabled + no effort → nothing emitted (endpoint's server default applies)
     - ollama_num_ctx      → extra_body.options.num_ctx, orthogonal to reasoning
 """
@@ -54,14 +52,11 @@ class TestCustomReasoningWireShape:
         assert tl == {}
 
     def test_disabled_sends_think_false(self, custom_profile):
-        """enabled=False on an Ollama URL → reasoning_effort='none' + think=False
-        + chat_template_kwargs.reasoning_effort='none'.
+        """enabled=False on an Ollama URL → reasoning_effort='none' + think=False.
 
-        All three fields are required on Ollama: /v1/chat/completions
-        silently ignores extra_body.think (only /api/chat honours it —
-        ollama#14820) but respects top-level reasoning_effort (#25758);
-        vLLM/SGLang serving Qwen3-style templates read the effort from
-        chat_template_kwargs. think=False stays for proxies and the
+        Ollama's /v1/chat/completions silently ignores extra_body.think (only
+        /api/chat honours it — ollama#14820) but respects top-level
+        reasoning_effort (#25758). think=False stays for proxies and the
         native /api/chat path.
         """
         eb, tl = custom_profile.build_api_kwargs_extras(
@@ -69,23 +64,17 @@ class TestCustomReasoningWireShape:
             model="qwen3",
             base_url="http://127.0.0.1:11434/v1",
         )
-        assert eb == {
-            "think": False,
-            "chat_template_kwargs": {"reasoning_effort": "none"},
-        }
+        assert eb == {"think": False}
         assert tl == {"reasoning_effort": "none"}
 
     def test_effort_none_sends_think_false(self, custom_profile):
-        """effort='none' is the disable alias → same triple emission."""
+        """effort='none' is the disable alias → same double emission."""
         eb, tl = custom_profile.build_api_kwargs_extras(
             reasoning_config={"enabled": True, "effort": "none"},
             model="qwen3",
             base_url="http://localhost:11434/v1",
         )
-        assert eb == {
-            "think": False,
-            "chat_template_kwargs": {"reasoning_effort": "none"},
-        }
+        assert eb == {"think": False}
         assert tl == {"reasoning_effort": "none"}
 
     def test_disabled_omits_think_on_mistral(self, custom_profile):
@@ -129,10 +118,7 @@ class TestCustomReasoningWireShape:
             model="qwen3",
             base_url="https://ollama.com/v1",
         )
-        assert eb == {
-            "think": False,
-            "chat_template_kwargs": {"reasoning_effort": "none"},
-        }
+        assert eb == {"think": False}
         assert tl == {"reasoning_effort": "none"}
 
     @pytest.mark.parametrize(
@@ -164,19 +150,19 @@ class TestCustomReasoningWireShape:
     )
     def test_enabled_effort_goes_top_level(self, custom_profile, effort):
         """enabled + effort → TOP-LEVEL reasoning_effort, passed through
-        verbatim, mirrored into chat_template_kwargs.
+        verbatim, with NO chat_template_kwargs injection.
 
-        GLM-5.2/ARK and OpenAI-compatible reasoning APIs read reasoning_effort
-        as a top-level string, not nested in extra_body. ``max`` is GLM's
-        native deep-reasoning level and must survive. The mirror covers
-        vLLM/SGLang Qwen3-style templates, which only read it from
-        chat_template_kwargs.
+        GLM-5.2/ARK and OpenAI-compatible reasoning APIs (vLLM, SGLang,
+        llama.cpp) read reasoning_effort as a top-level string, not nested
+        in extra_body. ``max`` is GLM's native deep-reasoning level and must
+        survive. Endpoints that need chat-template flags set them explicitly
+        via config extra_body.
         """
         eb, tl = custom_profile.build_api_kwargs_extras(
             reasoning_config={"enabled": True, "effort": effort}, model="glm-5.2"
         )
         assert tl == {"reasoning_effort": effort}
-        assert eb == {"chat_template_kwargs": {"reasoning_effort": effort}}
+        assert eb == {}
         assert "think" not in eb
 
     def test_enabled_without_effort_emits_nothing(self, custom_profile):
