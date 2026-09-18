@@ -1703,6 +1703,18 @@ def _normalized_cache_slug(provider: Optional[str]) -> str:
     return requested if requested == "ollama" else (normalize_provider(provider) or (provider or ""))
 
 
+def _custom_base_url_is_local() -> bool:
+    """Whether the configured custom endpoint sits on the local network (a LAN box): such servers
+    change their model lineup and context windows at operator timescales (models loaded onto a
+    llama.cpp/Ollama router), so their cached rows must never masquerade as current. Named custom
+    providers normalize to the ``custom`` slug, whose catalog is served from ``model.base_url``."""
+    try:
+        from agent.model_metadata import is_local_endpoint
+        return is_local_endpoint(_get_custom_base_url())
+    except Exception:
+        return False
+
+
 def _model_requires_account_discovery(provider: Optional[str], model: str) -> bool:
     """Astra names cannot confer API/OAuth entitlement through picker state."""
     return _normalized_cache_slug(provider) in {"openai", "openai-api", "openai-codex"} and is_astra_model(model)
@@ -1719,13 +1731,17 @@ def cached_provider_model_ids(
     is_ollama = normalized == "ollama"
     if is_ollama:
         ttl_seconds = min(ttl_seconds, _OLLAMA_LOCAL_MODELS_CACHE_TTL)
+    # Custom endpoint on the LAN: the server's catalog churns under us (models loaded/unloaded on a
+    # local router), so no cached row may masquerade as current — always live-fetch. Rows are still
+    # persisted below to feed offline fallbacks; a stopped box answers with its last known catalog.
+    live_only = normalized == "custom" and _custom_base_url_is_local()
 
     cache = _load_provider_models_cache()
     fp = _credential_fingerprint(normalized)
     entry = cache.get(normalized)
     now = time.time()
 
-    if not force_refresh and _cache_entry_valid(entry, fp, allow_empty=is_ollama):
+    if not force_refresh and not live_only and _cache_entry_valid(entry, fp, allow_empty=is_ollama):
         age = now - entry["at"]
         if age < ttl_seconds:
             return list(entry["models"])
@@ -2621,11 +2637,14 @@ def cached_fetch_api_models(
     api_mode: Optional[str] = None, headers: Optional[dict[str, str]] = None,
     force_refresh: bool = False, cache_only: bool = False,
     fetch_models=None,
-    ttl_seconds: int = _PROVIDER_MODELS_CACHE_TTL) -> Optional[list[str]]:
+    ttl_seconds: int = _PROVIDER_MODELS_CACHE_TTL,
+    native_catalog: bool = False) -> Optional[list[str]]:
     """Disk-cached :func:`fetch_api_models` for custom endpoints. ``cache_only`` callers (GUI picker
     opens that must not block on a stopped local endpoint) still get a warm catalog instead of
     collapsing to the config-declared subset. ``fetch_models`` supplies native-aware discovery
-    without minting a command token before cache admission."""
+    without minting a command token before cache admission. ``native_catalog=True`` marks the
+    Ollama-native flow, which keeps its own short-TTL/SWR contract even on LAN endpoints (the
+    live-only bypass below applies to generic /models discovery only)."""
     from hermes_cli.model_switch_providers import _NativePickerModelList
 
     def _catalog(entry):
@@ -2644,6 +2663,16 @@ def cached_fetch_api_models(
     if not normalized_url:  # nothing to key the cache on
         return None if cache_only else _live()
 
+    # A LAN endpoint (llama.cpp/Ollama box on the local network) changes its catalog at operator
+    # timescales, so a cached row must never masquerade as current: every non-cache-only call
+    # re-fetches live. Rows are still persisted to serve cache-only opens and the offline fallback.
+    # The Ollama-native flow keeps its tuned short-TTL/SWR contract (native_catalog=True).
+    try:
+        from agent.model_metadata import is_local_endpoint
+        live_only = (not native_catalog) and is_local_endpoint(normalized_url)
+    except Exception:
+        live_only = False
+
     # Key on URL AND credential fingerprint: N ``custom_providers`` rows can share one proxy URL
     # with distinct keys (#106184). A URL-only key let the last probe overwrite its siblings'
     # slot, so every other same-URL row failed the fingerprint check, got an empty catalog and
@@ -2654,7 +2683,7 @@ def cached_fetch_api_models(
     entry = cache.get(cache_key)
     now = time.time()
     native_row = isinstance(entry, dict) and entry.get("native_catalog") is True
-    valid = not force_refresh and _cache_entry_valid(entry, fp, allow_empty=native_row)
+    valid = not force_refresh and not live_only and _cache_entry_valid(entry, fp, allow_empty=native_row)
 
     if valid:
         age = now - entry["at"]
@@ -2676,6 +2705,10 @@ def cached_fetch_api_models(
             return _catalog(entry)
 
     if cache_only:
+        # A LAN open that skips probing still gets the last persisted live snapshot (written by the
+        # live-only path), never a TTL-gated row: the snapshot IS "last time we saw the server".
+        if live_only:
+            return _catalog(entry) if _cache_entry_valid(entry, fp, allow_empty=True) else None
         return None
 
     live = _live()

@@ -147,7 +147,8 @@ def _fetch_picker_live_models(
         native_models = (
             cached_fetch_api_models(
                 api_key, api_url, timeout=timeout, headers=headers, api_mode=api_mode,
-                fetch_models=_probe_native_catalog, ttl_seconds=_OLLAMA_LOCAL_MODELS_CACHE_TTL)
+                fetch_models=_probe_native_catalog, ttl_seconds=_OLLAMA_LOCAL_MODELS_CACHE_TTL,
+                native_catalog=True)
             if cache else _probe_native_catalog())
         if native_models is not None:
             return native_models

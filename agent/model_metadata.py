@@ -662,7 +662,8 @@ def _reconcile_local_cached_context_length(model: str, base_url: str, cached: in
 def is_local_endpoint(base_url: str) -> bool:
     """True for loopback, container-internal DNS, unqualified hosts, RFC-1918,
     link-local and Tailscale CGNAT (so a trusted Ollama box over Tailscale gets
-    the same timeout auto-bumps as localhost)."""
+    the same timeout auto-bumps as localhost). ``*.local`` (mDNS) and ``*.lan``
+    (private LAN naming; not a registered TLD) count as local too."""
     try:
         parsed = _parse_base_url(base_url)
         host = parsed.hostname or "" if parsed is not None else None
@@ -673,7 +674,7 @@ def is_local_endpoint(base_url: str) -> bool:
     # Unqualified hostnames (no dots) are local by definition — Docker Compose service names, /etc/hosts
     # entries, mDNS — as is `*.local` (RFC 6762 mDNS, LAN-only). IPv6 literals have no dots either, so
     # they are excluded here and classified by scope below (a global address is not local).
-    if host in _LOCAL_HOSTS or host.endswith(_CONTAINER_LOCAL_SUFFIXES) or host.endswith(".local") or (host and "." not in host and ":" not in host):
+    if host in _LOCAL_HOSTS or host.endswith(_CONTAINER_LOCAL_SUFFIXES) or host.endswith(".local") or host.endswith(".lan") or (host and "." not in host and ":" not in host):
         return True
     try:
         addr = ipaddress.ip_address(host)
@@ -1014,11 +1015,13 @@ def fetch_endpoint_model_metadata(base_url: str, api_key: str = "", force_refres
     _ensure_requests()
     local = is_local_endpoint(normalized)
     memo_key = _endpoint_memo_key(normalized, api_key)
-    if not force_refresh:
+    # Local (LAN) endpoints serve mutable catalogs — a llama.cpp router loads/unloads models under
+    # our feet — so any memo would pin yesterday's lineup; local reads always hit the live endpoint.
+    if not force_refresh and not local:
         cached = _endpoint_model_metadata_cache.get(memo_key)
         if cached is not None and (time.time() - _endpoint_model_metadata_cache_time.get(memo_key, 0)) < _ENDPOINT_MODEL_CACHE_TTL:
             return cached
-        memo = _endpoint_disk_cache_get(normalized) if not local else None
+        memo = _endpoint_disk_cache_get(normalized)
         if memo is not None:
             return _remember_endpoint_models(memo_key, memo)
     # Blackholed: return empty WITHOUT caching so it is retried once the entry expires.
@@ -1032,7 +1035,7 @@ def fetch_endpoint_model_metadata(base_url: str, api_key: str = "", force_refres
     if local:
         try:
             if detect_local_server_type(normalized, api_key=api_key) == "lm-studio":
-                return _remember_endpoint_models(memo_key, _lmstudio_native_models(normalized, headers))
+                return _lmstudio_native_models(normalized, headers)
         except Exception as exc:
             last_error = exc
             _note_if_connect_timeout(exc, normalized)
@@ -1057,7 +1060,7 @@ def fetch_endpoint_model_metadata(base_url: str, api_key: str = "", force_refres
                     _apply_llamacpp_props(cache, request_candidate, headers, verify)
             if cache and not local:
                 _endpoint_disk_cache_put(normalized, cache)
-            return _remember_endpoint_models(memo_key, cache)
+            return cache if local else _remember_endpoint_models(memo_key, cache)
         except Exception as exc:
             last_error = exc
             _note_if_connect_timeout(exc, normalized)
@@ -1066,7 +1069,7 @@ def fetch_endpoint_model_metadata(base_url: str, api_key: str = "", force_refres
                 response.close()
     if last_error:
         logger.debug("Failed to fetch model metadata from %s/models: %s", normalized, last_error)
-    return _remember_endpoint_models(memo_key, {})
+    return {} if local else _remember_endpoint_models(memo_key, {})
 
 
 def _resolve_endpoint_context_length(model: str, base_url: str, api_key: str = "") -> Optional[int]:

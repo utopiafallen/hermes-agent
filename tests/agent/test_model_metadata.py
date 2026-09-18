@@ -893,6 +893,89 @@ class TestFetchEndpointModelMetadata:
 
 
 # =========================================================================
+# LAN (local) custom endpoints — metadata caching must stay live
+# =========================================================================
+
+class TestLanEndpointLiveOnly:
+    """A custom provider on the local network (llama.cpp/Ollama router, e.g. a ``*.lan``
+    host) changes its model lineup and context windows at operator timescales. Caches
+    may feed offline fallbacks but must NEVER serve a stale row as current:
+
+      1. ``*.lan`` hostnames classify as local (like mDNS ``*.local``); public hosts do not.
+      2. ``fetch_endpoint_model_metadata`` never memoizes (memory or disk) a local endpoint —
+         every call re-probes the live /models endpoint.
+      3. A failed local probe is not remembered either, so recovery is immediate.
+      4. A persistent context-length entry for a local endpoint is reconciled against a
+         live probe instead of being served verbatim.
+    """
+
+    def setup_method(self):
+        import agent.model_metadata as mm
+        mm._endpoint_model_metadata_cache.clear()
+        mm._endpoint_model_metadata_cache_time.clear()
+
+    def _success_response(self, models):
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {"data": [{"id": mid, "context_length": 131072} for mid in models]}
+        return response
+
+    def test_lan_hostnames_classify_local_public_hosts_do_not(self):
+        from agent.model_metadata import is_local_endpoint
+        assert is_local_endpoint("http://chibigamer.lan:1235/v1") is True
+        assert is_local_endpoint("http://192.168.1.10:8080") is True
+        assert is_local_endpoint("http://node.local:11434") is True
+        assert is_local_endpoint("https://gw.example.com/v1") is False
+
+    def test_lan_probe_is_never_memoized_in_memory_or_on_disk(self, monkeypatch):
+        import agent.model_metadata as mm
+
+        monkeypatch.setattr(mm, "detect_local_server_type", lambda *a, **k: None)
+        url = "http://node.lan:1234/v1"
+        with patch("agent.model_metadata.requests.get",
+                   return_value=self._success_response(["m1", "m2"])) as mock_get:
+            first = mm.fetch_endpoint_model_metadata(url)
+            second = mm.fetch_endpoint_model_metadata(url)
+        assert first["m1"]["context_length"] == second["m2"]["context_length"] == 131072
+        assert mock_get.call_count == 2, "a second read of a LAN endpoint must re-probe live"
+        assert url not in mm._endpoint_model_metadata_cache, "local rows must not enter the memory memo"
+        assert mm._endpoint_disk_cache_get(url) is None, "local probes must not be memoized on disk"
+
+    def test_lan_probe_failure_is_not_remembered(self, monkeypatch):
+        import agent.model_metadata as mm
+
+        monkeypatch.setattr(mm, "detect_local_server_type", lambda *a, **k: None)
+        url = "http://node.lan:1234/v1"
+        failing = MagicMock()
+        failing.status_code = 500
+        failing.raise_for_status.side_effect = RuntimeError("500")
+        # Both candidates (/v1 and root) must fail for the call to come back empty.
+        with patch("agent.model_metadata.requests.get",
+                   side_effect=[failing, failing,
+                                self._success_response(["m1"]), self._success_response(["m1"])]) as mock_get:
+            assert mm.fetch_endpoint_model_metadata(url) == {}
+            assert mm.fetch_endpoint_model_metadata(url)["m1"]["context_length"] == 131072
+        assert mock_get.call_count == 3, "a failed LAN probe must not pin an empty verdict"
+
+    def test_stale_persistent_context_entry_for_lan_is_reconciled_live(self, tmp_path, monkeypatch):
+        import agent.model_metadata as mm
+
+        cache_file = tmp_path / "context_length_cache.yaml"
+        cache_file.write_text(yaml.safe_dump(
+            {"context_lengths": {"qwen3@http://node.lan:1235/v1": 8192}}, allow_unicode=True), encoding="utf-8")
+        monkeypatch.setattr(mm, "_get_context_cache_path", lambda: cache_file)
+        monkeypatch.setattr(mm, "detect_local_server_type", lambda *a, **k: None)
+        monkeypatch.setattr(mm, "_LOCAL_CTX_PROBE_CACHE", {})
+        # The server restarted with a bigger window; the live probe reports it.
+        monkeypatch.setattr(mm, "_query_local_context_length_uncached", lambda model, base_url, api_key="": 131_072)
+
+        ctx = mm.get_model_context_length(
+            "qwen3", base_url="http://node.lan:1235/v1", api_key="k", provider="custom")
+
+        assert ctx == 131_072, "a persisted value for a LAN endpoint must lose to the live probe"
+
+
+# =========================================================================
 # Nous Portal context-window resolution (provider="nous")
 # =========================================================================
 

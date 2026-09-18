@@ -296,6 +296,72 @@ class TestCachedFetchApiModelsDiskRoundTrip:
         assert mod.cached_fetch_api_models("sk-B", url, cache_only=True) == ["models-for-sk-B"]
 
 
+class TestLanLiveOnly:
+    """A custom endpoint on the local network (llama.cpp/Ollama router, e.g. a ``*.lan`` host)
+    changes its model lineup at operator timescales: no TTL/SWR row may masquerade as current.
+    Every non-cache-only read re-fetches live; persisted rows still feed cache-only opens
+    (which refuse to block on the network) and offline fallbacks (stale beats nothing)."""
+
+    def test_lan_read_always_live_even_when_a_fresh_row_exists(self, monkeypatch):
+        import hermes_cli.models as mod
+
+        calls = []
+
+        def fake_fetch(api_key, base_url, **kwargs):
+            calls.append(base_url)
+            return ["live-model"]
+
+        monkeypatch.setattr(mod, "fetch_api_models", fake_fetch)
+
+        url = "http://node.lan:8080/v1"
+        assert mod.cached_fetch_api_models("sk-key", url) == ["live-model"]
+        assert mod.cached_fetch_api_models("sk-key", url) == ["live-model"]
+
+        assert len(calls) == 2, "a fresh cached row must NOT short-circuit a LAN read"
+        # Rows are still persisted so cache-only opens and offline fallbacks have data.
+        assert any(k.startswith("custom:http://node.lan:8080/v1#") for k in mod._load_provider_models_cache())
+
+    def test_public_endpoint_still_served_from_a_fresh_row(self, monkeypatch):
+        """The live-only gate must not leak to remote endpoints: their fresh rows keep working."""
+        import hermes_cli.models as mod
+
+        calls = []
+        monkeypatch.setattr(
+            mod, "fetch_api_models",
+            lambda api_key, base_url, **k: calls.append(base_url) or ["remote-model"])
+
+        url = "https://gw.example.com/v1"
+        assert mod.cached_fetch_api_models("sk-key", url) == ["remote-model"]
+        assert mod.cached_fetch_api_models("sk-key", url) == ["remote-model"]
+        assert len(calls) == 1
+
+    def test_lan_offline_falls_back_to_last_persisted_snapshot(self, monkeypatch):
+        import hermes_cli.models as mod
+
+        url = "http://node.lan:8080/v1"
+        monkeypatch.setattr(mod, "fetch_api_models", lambda *a, **k: ["last-seen-model"])
+        assert mod.cached_fetch_api_models("sk-key", url) == ["last-seen-model"]
+
+        monkeypatch.setattr(mod, "fetch_api_models", lambda *a, **k: None)  # box is down
+        assert mod.cached_fetch_api_models("sk-key", url) == ["last-seen-model"]
+
+    def test_lan_cache_only_serves_last_snapshot_without_network(self, monkeypatch):
+        import hermes_cli.models as mod
+
+        url = "http://node.lan:8080/v1"
+        monkeypatch.setattr(mod, "fetch_api_models", lambda *a, **k: ["snapshot-model"])
+        assert mod.cached_fetch_api_models("sk-key", url) == ["snapshot-model"]
+
+        monkeypatch.setattr(mod, "fetch_api_models", lambda *a, **k: pytest.fail("cache_only must not fetch"))
+        assert mod.cached_fetch_api_models("sk-key", url, cache_only=True) == ["snapshot-model"]
+
+    def test_lan_cache_only_with_no_snapshot_is_a_miss(self, monkeypatch):
+        import hermes_cli.models as mod
+
+        monkeypatch.setattr(mod, "fetch_api_models", lambda *a, **k: pytest.fail("cache_only must not fetch"))
+        assert mod.cached_fetch_api_models("sk-key", "http://node.lan:8080/v1", cache_only=True) is None
+
+
 class TestSalvageFollowups:
     """Follow-up behaviors added while salvaging PR #80740: SWR stale-serve
     parity with cached_provider_model_ids, and corrupt-cache degradation."""
